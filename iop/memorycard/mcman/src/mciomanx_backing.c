@@ -113,7 +113,8 @@ int mcman_iomanx_backing_mount(int port, int slot, const char *filename)
 			r = -EINVAL;
 			goto cleanup;
 		}
-		total_pages = superblock.pages_per_cluster * superblock.blocksize;
+		// blocksize is pages per erase block; the card holds clusters_per_card clusters
+		total_pages = superblock.pages_per_cluster * superblock.clusters_per_card;
 		// Check card ECC
 		if (cardsize == ((superblock.pagesize + 0x10) * total_pages)) {
 			cardinfo->has_ecc = 1;
