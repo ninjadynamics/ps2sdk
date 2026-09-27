@@ -140,6 +140,9 @@ int mcman_iomanx_backing_mount(int port, int slot, const char *filename)
 		cardinfo->flags = superblock.cardflags;
 	}
 
+	// The probe below reads the card through this slot, so it must count as
+	// mounted now; a failed probe clears the slot again in cleanup.
+	cardinfo->mounted = 1;
 	mcman_probePS2Card(port, slot);
 	if (McGetFormat(port, slot) > 0) {
 		r = 0; // Success
@@ -197,7 +200,8 @@ int mcman_iomanx_backing_getcardspec(int port, int slot, s16 *pagesize, u16 *blo
 	}
 
 	if (cardsize) {
-		*cardsize = cardinfo->cardsize;
+		// In pages, as the card's own spec reports it; cardinfo keeps bytes.
+		*cardsize = cardinfo->cardsize / (cardinfo->pagesize + (cardinfo->has_ecc ? 0x10 : 0));
 	}
 
 	if (flags) {
@@ -224,11 +228,14 @@ int mcman_iomanx_backing_erase(int port, int slot, int page)
 	{
 		char buf[528];
 		int effective_page_size;
+		int i;
 
 		memset(buf, ((cardinfo->flags & CF_ERASE_ZEROES) != 0) ? 0x0 : 0xFF, sizeof(buf));
 		effective_page_size = (cardinfo->pagesize + (cardinfo->has_ecc ? 0x10 : 0));
+		// page is the first page of an erase block: erase all of its pages
 		iomanX_lseek(cardinfo->fd, page * effective_page_size, FIO_SEEK_SET);
-		iomanX_write(cardinfo->fd, buf, effective_page_size);
+		for (i = 0; i < cardinfo->blocksize; i++)
+			iomanX_write(cardinfo->fd, buf, effective_page_size);
 	}
 
 	return 0;
