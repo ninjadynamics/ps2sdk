@@ -25,6 +25,29 @@ typedef struct vmc_cardinfo_
 
 static vmc_cardinfo_t mcman_vmc_cardinfo[MCMAN_MAXSLOT];
 
+// Page I/O helpers: nonzero means the host image did not take the whole
+// seek or transfer, so mcman sees a failed page operation instead of
+// acknowledging data that never reached (or never came from) the image.
+static int mcman_iomanx_backing_seek(int fd, int offset)
+{
+	return iomanX_lseek(fd, offset, FIO_SEEK_SET) != offset;
+}
+
+static int mcman_iomanx_backing_skip(int fd, int size)
+{
+	return iomanX_lseek(fd, size, FIO_SEEK_CUR) < 0;
+}
+
+static int mcman_iomanx_backing_write_all(int fd, void *buf, int size)
+{
+	return iomanX_write(fd, buf, size) != size;
+}
+
+static int mcman_iomanx_backing_read_all(int fd, void *buf, int size)
+{
+	return iomanX_read(fd, buf, size) != size;
+}
+
 static void mcman_iomanx_backing_clear_slot(int slot)
 {
 	vmc_cardinfo_t *cardinfo;
@@ -43,7 +66,7 @@ static int mcman_iomanx_backing_validate(int slot, int check_mounted)
 {
 	vmc_cardinfo_t *cardinfo;
 
-	if (slot > MCMAN_MAXSLOT) {
+	if (slot < 0 || slot >= MCMAN_MAXSLOT) {
 		return -EOVERFLOW;
 	}
 
@@ -68,12 +91,19 @@ int mcman_iomanx_backing_mount(int port, int slot, const char *filename)
 
 	r = mcman_iomanx_backing_validate(slot, 0);
 	if (r < 0) {
-		goto cleanup;
+		// No slot record exists, so there is nothing to clear
+		return r;
 	}
 
 	r = -EINVAL;
 
 	cardinfo = &mcman_vmc_cardinfo[slot];
+
+	// An unmounted slot owns no descriptor: its record may still be the
+	// static zero state, whose fd 0 cleanup must never close.
+	if (cardinfo->mounted == 0) {
+		cardinfo->fd = -1;
+	}
 
 	fd = iomanX_open(filename, FIO_O_RDWR, 0);
 	if (fd < 0) {
@@ -233,9 +263,14 @@ int mcman_iomanx_backing_erase(int port, int slot, int page)
 		memset(buf, ((cardinfo->flags & CF_ERASE_ZEROES) != 0) ? 0x0 : 0xFF, sizeof(buf));
 		effective_page_size = (cardinfo->pagesize + (cardinfo->has_ecc ? 0x10 : 0));
 		// page is the first page of an erase block: erase all of its pages
-		iomanX_lseek(cardinfo->fd, page * effective_page_size, FIO_SEEK_SET);
-		for (i = 0; i < cardinfo->blocksize; i++)
-			iomanX_write(cardinfo->fd, buf, effective_page_size);
+		if (mcman_iomanx_backing_seek(cardinfo->fd, page * effective_page_size)) {
+			return 1;
+		}
+		for (i = 0; i < cardinfo->blocksize; i++) {
+			if (mcman_iomanx_backing_write_all(cardinfo->fd, buf, effective_page_size)) {
+				return 1;
+			}
+		}
 	}
 
 	return 0;
@@ -259,20 +294,26 @@ int mcman_iomanx_backing_write(int port, int slot, int page, void *pagebuf, void
 		int effective_page_size;
 
 		effective_page_size = (cardinfo->pagesize + (cardinfo->has_ecc ? 0x10 : 0));
-		iomanX_lseek(cardinfo->fd, page * effective_page_size, FIO_SEEK_SET);
+		if (mcman_iomanx_backing_seek(cardinfo->fd, page * effective_page_size)) {
+			return 1;
+		}
 		if (pagebuf != NULL) {
-			iomanX_write(cardinfo->fd, pagebuf, 512);
+			if (mcman_iomanx_backing_write_all(cardinfo->fd, pagebuf, 512)) {
+				return 1;
+			}
 		}
-		else {
-			iomanX_lseek(cardinfo->fd, 512, FIO_SEEK_CUR);
+		else if (mcman_iomanx_backing_skip(cardinfo->fd, 512)) {
+			return 1;
 		}
-		
+
 		if (cardinfo->has_ecc) {
 			if (eccbuf != NULL) {
-				iomanX_write(cardinfo->fd, eccbuf, 16);
+				if (mcman_iomanx_backing_write_all(cardinfo->fd, eccbuf, 16)) {
+					return 1;
+				}
 			}
-			else {
-				iomanX_lseek(cardinfo->fd, 16, FIO_SEEK_CUR);
+			else if (mcman_iomanx_backing_skip(cardinfo->fd, 16)) {
+				return 1;
 			}
 		}
 	}
@@ -303,20 +344,26 @@ int mcman_iomanx_backing_read(int port, int slot, int page, void *pagebuf, void 
 		pagesize = cardinfo->pagesize;
 
 		effective_page_size = (cardinfo->pagesize + (cardinfo->has_ecc ? 0x10 : 0));
-		iomanX_lseek(cardinfo->fd, page * effective_page_size, FIO_SEEK_SET);
+		if (mcman_iomanx_backing_seek(cardinfo->fd, page * effective_page_size)) {
+			return 1;
+		}
 		if (pagebuf != NULL) {
-			iomanX_read(cardinfo->fd, pagebuf, 512);
+			if (mcman_iomanx_backing_read_all(cardinfo->fd, pagebuf, 512)) {
+				return 1;
+			}
 		}
-		else {
-			iomanX_lseek(cardinfo->fd, 512, FIO_SEEK_CUR);
+		else if (mcman_iomanx_backing_skip(cardinfo->fd, 512)) {
+			return 1;
 		}
-		
+
 		if (cardinfo->has_ecc) {
 			if (eccbuf != NULL) {
-				iomanX_read(cardinfo->fd, eccbuf, 16);
+				if (mcman_iomanx_backing_read_all(cardinfo->fd, eccbuf, 16)) {
+					return 1;
+				}
 			}
-			else {
-				iomanX_lseek(cardinfo->fd, 16, FIO_SEEK_CUR);
+			else if (mcman_iomanx_backing_skip(cardinfo->fd, 16)) {
+				return 1;
 			}
 		} else if (pagebuf != NULL && eccbuf != NULL) {
 			int i;
